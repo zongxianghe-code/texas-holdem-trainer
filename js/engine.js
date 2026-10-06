@@ -53,6 +53,7 @@ export class HoldemGame {
    * @param {string[]} [opts.names]
    * @param {number} [opts.dealerSeat=0] 第一手的庄家座位
    * @param {() => number} [opts.rng] 洗牌随机源
+   * @param {boolean} [opts.allowRebuy=false] 允许重新买入（一手结束后不因只剩一人而直接结束游戏）
    */
   constructor(opts = {}) {
     const {
@@ -64,6 +65,7 @@ export class HoldemGame {
       names,
       dealerSeat = 0,
       rng,
+      allowRebuy = false,
     } = opts;
     const n = stacks ? stacks.length : numPlayers;
     if (!Number.isInteger(n) || n < 2 || n > 9) throw new Error('玩家人数必须在 2 到 9 之间');
@@ -86,10 +88,14 @@ export class HoldemGame {
       folded: false,
       allIn: false,
       out: false, // 已出局（筹码输光）
+      buyIn: stack, // 累计买入（初始筹码 + 重新买入）
+      rebuys: 0, // 重新买入次数
       hasActed: false,
       raiseSeen: 0,
       lastAction: '',
     }));
+    this.initialStacks = initial.slice();
+    this.allowRebuy = !!allowRebuy; // 允许重新买入时，一手结束不直接判定游戏结束（由外部先为输光的座位买入）
     this.dealer = (((dealerSeat % n) + n) % n) - 1; // startHand 会移动到下一个有效座位
     this.handNumber = 0;
     this.phase = 'waiting'; // waiting | betting | handOver | gameOver
@@ -120,6 +126,65 @@ export class HoldemGame {
   /** 桌面上所有筹码（用于守恒校验） */
   get totalChips() {
     return this.players.reduce((s, p) => s + p.stack, 0) + this.pot;
+  }
+
+  /** 所有座位的累计买入（初始筹码 + 重新买入）；筹码守恒：totalChips === totalBuyIn */
+  get totalBuyIn() {
+    return this.players.reduce((s, p) => s + p.buyIn, 0);
+  }
+
+  /** 某座位的净盈亏 = 当前筹码（含本手已投入）− 累计买入 */
+  netProfit(seat) {
+    const p = this.players[seat];
+    return p.stack + p.totalBet - p.buyIn;
+  }
+
+  /**
+   * 重新买入的金额：仍有筹码的玩家的平均筹码，取整到大盲的整数倍；
+   * 至少 1 个大盲，且不低于 min(20BB, 最大初始筹码)。
+   */
+  rebuyAmount() {
+    const bb = this.bigBlind;
+    const live = this.players.filter((p) => !p.out && p.stack > 0);
+    const avg = live.length ? live.reduce((s, p) => s + p.stack, 0) / live.length : Math.max(...this.initialStacks);
+    const rounded = Math.round(avg / bb) * bb;
+    return Math.max(bb, rounded, Math.min(20 * bb, Math.max(...this.initialStacks)));
+  }
+
+  /**
+   * 为输光的座位重新买入（只能在两手牌之间进行）。
+   * @returns {number} 实际买入金额
+   */
+  rebuy(seat, amount = this.rebuyAmount()) {
+    if (this.phase === 'betting') throw new Error('牌局进行中不能重新买入');
+    const p = this.players[seat];
+    if (!p) throw new Error('无效座位');
+    if (p.stack > 0) throw new Error(`${p.name} 还有筹码，不需要重新买入`);
+    if (!isPosInt(amount)) throw new Error('买入金额必须是正整数');
+    p.stack = amount;
+    p.out = false;
+    p.buyIn += amount;
+    p.rebuys++;
+    p.lastAction = '重新买入';
+    const net = p.stack - p.buyIn;
+    this._log(`${p.name} 重新买入 ${amount}（第 ${p.rebuys} 次，累计买入 ${p.buyIn}，净盈亏 ${net >= 0 ? '+' : ''}${net}）`, 'rebuy', { seat, amount });
+    if (this.phase === 'gameOver' && this.players.filter((q) => !q.out).length >= 2) {
+      this.phase = 'handOver';
+      this.winner = null;
+    }
+    return amount;
+  }
+
+  /**
+   * 为所有满足条件且输光的座位按同一平均筹码重新买入（先算金额，再逐个买入）。
+   * @returns {{seat:number, amount:number}[]}
+   */
+  rebuyBusted(pred = () => true) {
+    if (this.phase === 'betting') return [];
+    const busted = this.players.filter((p) => p.stack <= 0 && pred(p));
+    if (!busted.length) return [];
+    const amount = this.rebuyAmount();
+    return busted.map((p) => ({ seat: p.seat, amount: this.rebuy(p.seat, amount) }));
   }
 
   inHand(p) {
@@ -497,7 +562,7 @@ export class HoldemGame {
       }
     }
     const alive = this.players.filter((p) => !p.out);
-    if (alive.length <= 1) {
+    if (alive.length <= 1 && !this.allowRebuy) {
       this.phase = 'gameOver';
       this.winner = alive[0]?.seat ?? null;
       if (alive[0]) this._log(`游戏结束，${alive[0].name} 赢得全部筹码！`, 'result');
