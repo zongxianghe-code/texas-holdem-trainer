@@ -1,0 +1,12 @@
+{
+  "name": "texas-holdem-trainer",
+  "version": "0.1.0",
+  "description": "浏览器德州扑克自对弈训练器（纯前端，无需构建）",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "start": "python3 -m http.server 8000"
+  },
+  "license": "MIT"
+}
