@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>德州扑克训练器 · Texas Hold'em Trainer</title>
+  <meta name="description" content="浏览器里的德州扑克自对弈训练器：一个人操控所有座位，显示真实胜率、底池赔率与牌型。" />
+  <meta name="theme-color" content="#0c1218" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>♠</text></svg>" />
+  <link rel="stylesheet" href="css/style.css" />
+  <script type="module" src="js/ui.js"></script>
+</head>
+<body>
+  <div id="app">
+    <!-- 设置界面 -->
+    <section id="setup-screen" class="screen">
+      <div class="setup-card">
+        <h1><span class="logo">♠♥</span> 德州扑克训练器</h1>
+        <p class="subtitle">一个人操控牌桌上的所有座位，自己和自己对局，练习每一个决策。</p>
+        <form id="setup-form" novalidate>
+          <div class="form-grid">
+            <label>玩家人数
+              <select id="num-players">
+                <option>2</option><option>3</option><option>4</option><option>5</option>
+                <option selected>6</option><option>7</option><option>8</option><option>9</option>
+              </select>
+            </label>
+            <label>初始筹码
+              <input id="starting-stack" type="number" min="1" step="1" value="1000" inputmode="numeric" />
+            </label>
+            <label>小盲
+              <input id="small-blind" type="number" min="1" step="1" value="5" inputmode="numeric" />
+            </label>
+            <label>大盲
+              <input id="big-blind" type="number" min="1" step="1" value="10" inputmode="numeric" />
+            </label>
+          </div>
+          <label class="check">
+            <input id="setup-show-all" type="checkbox" checked />
+            训练模式：显示所有玩家的手牌
+          </label>
+          <p id="setup-error" class="error" role="alert"></p>
+          <button type="submit" class="btn primary big">开始游戏</button>
+        </form>
+        <details class="howto">
+          <summary>玩法说明</summary>
+          <ul>
+            <li>座位依次命名为 玩家1、玩家2 …，轮到谁行动，谁的座位就会高亮，由你替他做决定。</li>
+            <li>行动按钮：弃牌 / 过牌 / 跟注 / 下注 / 加注 / 全下。用滑杆或快捷按钮（1/2 池、2/3 池、底池）选择下注大小。</li>
+            <li>右侧“训练辅助”显示当前行动玩家的牌型、对其他在局玩家<b>真实手牌</b>的胜率，以及跟注所需的底池赔率。</li>
+            <li>关闭“显示所有手牌”后，只显示正在行动的玩家的底牌，适合模拟真实信息。</li>
+            <li>快捷键：F 弃牌，C 过牌/跟注，R 下注/加注，回车 下一手。</li>
+          </ul>
+        </details>
+      </div>
+    </section>
+
+    <!-- 牌桌界面 -->
+    <section id="game-screen" class="screen hidden">
+      <header class="topbar">
+        <div class="tb-left">
+          <span class="tb-title">♠ 德扑训练</span>
+          <span id="hand-info" class="tb-info"></span>
+        </div>
+        <div class="tb-right">
+          <label class="toggle" title="训练模式：显示所有玩家的底牌">
+            <input id="show-all" type="checkbox" checked />
+            <span>显示所有手牌</span>
+          </label>
+          <button id="new-game" class="btn small ghost">新游戏</button>
+        </div>
+      </header>
+      <main class="layout">
+        <div class="table-col">
+          <div class="table-wrap" id="table-wrap">
+            <div class="felt">
+              <div class="center">
+                <div id="street-name" class="street-name"></div>
+                <div id="board" class="board"></div>
+                <div id="pot" class="pot"></div>
+                <div id="result-banner" class="result-banner"></div>
+              </div>
+            </div>
+            <div id="seats"></div>
+          </div>
+          <div id="action-panel" class="panel action-panel"></div>
+        </div>
+        <aside class="side-col">
+          <div id="training-panel" class="panel training-panel"></div>
+          <details class="panel log-panel" id="log-details" open>
+            <summary>牌局日志</summary>
+            <div id="log" class="log"></div>
+          </details>
+        </aside>
+      </main>
+    </section>
+  </div>
+  <noscript>此页面需要启用 JavaScript。</noscript>
+</body>
+</html>
