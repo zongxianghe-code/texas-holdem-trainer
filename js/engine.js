@@ -352,7 +352,7 @@ export class HoldemGame {
 
     p.hasActed = true;
     p.raiseSeen = this.fullRaiseCount;
-    this._log(`${p.name} ${text}`, 'action', { seat: p.seat, action: type });
+    this._log(`${p.name} ${text}`, 'action', { seat: p.seat, action: type, amount: p.bet, allIn: p.allIn });
     this._advance(p.seat);
   }
 
