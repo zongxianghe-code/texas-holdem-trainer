@@ -183,7 +183,7 @@ export function preflopStrength() {
 }
 
 /**
- * 唯一允许的下注尺度（底池比例）：1/3、1/2、2/3、4/3（超池）。
+ * 翻牌后唯一允许的下注尺度（底池比例）：1/3、1/2、2/3、4/3（超池）。翻牌前使用以大盲为单位的常规尺度。
  * “下注到”金额 = 当前最高下注 + 比例 × (底池 + 跟注所需)，与界面快捷按钮完全一致；
  * 结果再限制到合法的最小加注与全下之间。
  */
@@ -208,24 +208,79 @@ export function allowedSizes(la) {
   return BET_SIZES.map((b) => ({ ...b, to: potFractionTo(la, b.frac) }));
 }
 
-/** 翻牌前加注使用的底池比例 */
-function preflopRaiseFrac(spot) {
-  const oop = spot.position === 'SB' || spot.position === 'BB';
+// ---------------------------------------------------------------- 翻牌前尺度（以大盲为单位）
+// 常见 6-max 100BB 尺度：开池 2.5BB（小盲 3BB）；隔离溜入 3BB + 每名溜入者 1BB；
+// 3bet 有位置约 3 倍、无位置（SB/BB）约 4 倍；挤压 4 倍 + 每名跟注者 1 倍；4bet 约 2.2 倍；5bet 全下。
+
+/** 翻牌前推荐尺度（未限制）：{ to, label, kind } */
+export function preflopSizing(game, spot) {
+  const bb = game.bigBlind;
+  const p = spot.position;
+  const oop = p === 'SB' || p === 'BB';
+  const last = spot.raises[spot.raises.length - 1];
   switch (spot.type) {
-    case 'rfi':
-      return 2 / 3; // 约 2.7BB
+    case 'rfi': {
+      const sb = p === 'SB' && !isHeadsUp(game);
+      return { to: Math.round((sb ? 3 : 2.5) * bb), label: sb ? '3BB' : '2.5BB', kind: sb ? 'sbOpen' : 'open' };
+    }
     case 'vsLimp':
     case 'sbVsLimp':
     case 'bbVsLimp':
-      return oop ? 4 / 3 : 2 / 3;
+      return { to: Math.round((3 + spot.limpers) * bb), label: `${3 + spot.limpers}BB（3BB + ${spot.limpers} 名溜入者各 1BB）`, kind: 'iso' };
     case 'vsOpen':
-      return oop || spot.callersAfter > 0 ? 4 / 3 : 2 / 3; // 3bet：有位置约 2.7 倍，无位置/挤压约 4.5 倍
+      if (spot.callersAfter > 0) {
+        const m = 4 + spot.callersAfter;
+        return { to: Math.round(last.amount * m), label: `${m} 倍（4 倍 + ${spot.callersAfter} 名跟注者各 1 倍）`, kind: 'squeeze' };
+      }
+      return oop
+        ? { to: Math.round(last.amount * 4), label: '4 倍', kind: '3betOOP' }
+        : { to: Math.round(last.amount * 3), label: '3 倍', kind: '3betIP' };
     case 'vs3bet':
     case 'coldVs3bet':
-      return 1 / 2; // 4bet 约 2.1 倍
+      return { to: Math.round(last.amount * 2.2), label: '2.2 倍', kind: '4bet' };
     default:
-      return 4 / 3; // 5bet 及以上：最大尺度（通常被限制为全下）
+      return { to: Infinity, label: '全下', kind: 'jam' };
   }
+}
+
+/** 限制到合法区间 */
+export const clampRaise = (la, to) => clamp(Number.isFinite(to) ? Math.round(to) : la.maxRaiseTo, la.minRaiseTo, la.maxRaiseTo);
+
+/**
+ * 行动面板翻牌前快捷按钮（以大盲为单位）：
+ * 无人加注：2BB / 2.5BB / 3BB（有溜入者时每人再加 1BB）；面对一次加注：3x / 4x；面对 3bet 及以上：2.2x / 3x。
+ */
+export function preflopQuickSizes(game, la) {
+  const bb = game.bigBlind;
+  const acts = handActions(game, 'preflop');
+  const raises = acts.filter((a) => a.action === 'raise' || a.action === 'bet');
+  let opts;
+  if (raises.length === 0) {
+    let limpers = 0;
+    for (const a of acts) if (a.action === 'call') limpers++;
+    opts = [2, 2.5, 3].map((x) => ({ label: limpers ? `${x + limpers}BB` : `${x}BB`, to: Math.round((x + limpers) * bb) }));
+  } else {
+    const last = raises[raises.length - 1].amount;
+    const mults = raises.length === 1 ? [3, 4] : [2.2, 3];
+    opts = mults.map((m) => ({ label: `${m}x`, to: Math.round(last * m) }));
+  }
+  const seen = new Set();
+  return opts
+    .map((o) => ({ ...o, to: clampRaise(la, o.to) }))
+    .filter((o) => (seen.has(o.to) ? false : (seen.add(o.to), true)));
+}
+
+/** 翻牌前位于身后、尚未行动且仍在局的玩家数（不含自己） */
+export function playersBehind(game, seat) {
+  const n = game.players.length;
+  const order = [];
+  const first = isHeadsUp(game) ? game.dealer : game.nextSeat(game.bbSeat, (p) => !p.out);
+  for (let i = 0; i < n; i++) {
+    const s = (first + i) % n;
+    if (!game.players[s].out) order.push(s);
+  }
+  const idx = order.indexOf(seat);
+  return order.slice(idx + 1).filter((s) => !game.players[s].folded && !game.players[s].hasActed).length;
 }
 
 /**
@@ -262,9 +317,20 @@ export function preflopStrategy(game, seat = game.toAct) {
       }
     }
   }
-  const raiseFrac = preflopRaiseFrac(spot);
-  const raiseTo = la && la.canRaise ? potFractionTo(la, raiseFrac) : null;
-  return { street: 'preflop', spot, position: pos[seat], handClass: hc, freqs, raiseTo, raiseFrac, notes, tableKey: spot.key };
+  const sizing = preflopSizing(game, spot);
+  const raiseTo = la && la.canRaise ? clampRaise(la, sizing.to) : null;
+  return {
+    street: 'preflop',
+    spot,
+    position: pos[seat],
+    handClass: hc,
+    freqs,
+    raiseTo,
+    sizing,
+    playersBehind: playersBehind(game, seat),
+    notes,
+    tableKey: spot.key,
+  };
 }
 
 /**
