@@ -75,6 +75,14 @@
             <input id="setup-show-all" type="checkbox" />
             <span id="setup-show-all-label">训练用：显示电脑的底牌</span>
           </label>
+          <label class="check tight" id="setup-review-wrap">
+            <input id="setup-review" type="checkbox" checked />
+            <span>每手结束后查看电脑手牌（包括弃牌的电脑，用于复盘）</span>
+          </label>
+          <label class="check tight">
+            <input id="setup-rebuy" type="checkbox" checked />
+            <span>允许重新买入（输光后按桌面平均筹码重新买入，电脑自动买入）</span>
+          </label>
           <label class="check tight">
             <input id="setup-advice" type="checkbox" checked />
             <span>显示 GTO 风格建议与决策反馈</span>
@@ -85,10 +93,12 @@
         <details class="howto">
           <summary>玩法说明</summary>
           <ul>
-            <li><b>人机对战</b>：你坐在选定的座位（显示为“你”），其余 5 位电脑按位置范围表与翻牌后启发式策略自动行动。电脑底牌在摊牌前隐藏（可在顶栏打开显示）。</li>
+            <li><b>人机对战</b>：你坐在选定的座位（显示为“你”），其余 5 位电脑按位置范围表与翻牌后启发式策略自动行动。电脑底牌在手牌进行中隐藏（可在顶栏打开显示）。</li>
             <li><b>自对弈</b>：座位依次命名为 玩家1、玩家2 …，轮到谁行动谁的座位就会高亮，由你替他做决定。</li>
-            <li><b>GTO 建议</b>：翻牌前给出范围表中的推荐频率（如 加注 70% / 弃牌 30%）和 13×13 范围图；翻牌后给出近似建议（非求解器结果）。行动后会提示你的选择是否符合。</li>
-            <li>行动按钮：弃牌 / 过牌 / 跟注 / 下注 / 加注 / 全下。用滑杆或快捷按钮（1/2 池、2/3 池、底池）选择下注大小。</li>
+            <li><b>GTO 建议</b>：翻牌前给出范围表中的推荐频率（如 加注 70% / 弃牌 30%）、以大盲为单位的尺度和 13×13 范围图；翻牌后给出近似建议（非求解器结果，尺度只用 1/3、1/2、2/3、4/3 底池）。每条建议都附带“为什么”，行动后会提示你的选择是否符合及原因。</li>
+            <li><b>复盘</b>：开启“每手结束后查看电脑手牌”后，每手结束（包括所有人弃牌的情况）都会亮出电脑底牌并写入日志。</li>
+            <li><b>重新买入</b>：开启“允许重新买入”后，电脑输光会自动按桌面平均筹码重新买入，保持满桌；你输光时可点“按平均筹码重新买入”。侧栏“筹码统计”显示每个座位的买入次数、累计买入与净盈亏。</li>
+            <li>行动按钮：弃牌 / 过牌 / 跟注 / 下注 / 加注 / 全下。快捷尺度：翻牌前按大盲（如 2BB / 2.5BB / 3BB，面对加注 3x / 4x），翻牌后 1/3 池、1/2 池、2/3 池、4/3 池；也可用滑杆或输入框。</li>
             <li>右侧“训练辅助”显示当前行动玩家的牌型、对其他在局玩家<b>真实手牌</b>的胜率，以及跟注所需的底池赔率。</li>
             <li>关闭“显示所有手牌”后，只显示正在行动的玩家的底牌，适合模拟真实信息。</li>
             <li>快捷键：F 弃牌，C 过牌/跟注，R 下注/加注，回车 下一手。</li>
@@ -110,6 +120,10 @@
             <select id="speed">
               <option value="1200">慢</option><option value="700">正常</option><option value="300">快</option><option value="0">瞬间</option>
             </select>
+          </label>
+          <label class="toggle hidden" id="review-wrap" title="每手结束后查看电脑手牌">
+            <input id="review-bots" type="checkbox" checked />
+            <span>每手结束后查看电脑手牌</span>
           </label>
           <label class="toggle" title="训练用：显示底牌">
             <input id="show-all" type="checkbox" checked />
@@ -136,6 +150,10 @@
         <aside class="side-col">
           <div id="advice-panel" class="panel advice-panel"></div>
           <div id="training-panel" class="panel training-panel"></div>
+          <details class="panel stats-panel" id="stats-details">
+            <summary>筹码统计（买入 / 净盈亏）</summary>
+            <div id="stats"></div>
+          </details>
           <details class="panel log-panel" id="log-details" open>
             <summary>牌局日志</summary>
             <div id="log" class="log"></div>

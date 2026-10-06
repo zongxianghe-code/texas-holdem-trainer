@@ -7,7 +7,8 @@ import { RANK_LABELS, SUIT_SYMBOLS, rankOf, suitOf, isRed } from './cards.js';
 import { decideBotAction, legalize } from './bot.js';
 import { getAdvice, evaluateDecision, adviceSummary, POSTFLOP_DISCLAIMER } from './advice.js';
 import { getTable, gridHand } from './ranges.js';
-import { BET_SIZES, potFractionTo, sizeLabel } from './strategy.js';
+import { BET_SIZES, potFractionTo, sizeLabel, preflopQuickSizes } from './strategy.js';
+import { isHoleVisible, buildHandReview, reviewLogLines } from './review.js';
 
 const EQUITY_ITERATIONS = 3000;
 const SETTINGS_KEY = 'holdem-trainer-settings';
@@ -22,6 +23,8 @@ const state = {
   difficulty: 'standard',
   botSpeed: 700,
   showAdvice: true,
+  reviewBots: true, // 每手结束后查看电脑手牌
+  reviewLogged: 0,
   showRange: false,
   advice: null, // { key, data }
   feedback: [], // 本手的决策反馈
@@ -84,6 +87,8 @@ function loadSettings() {
     // v0.1 保存的设置没有 mode 字段：沿用新的默认值（人机模式默认隐藏电脑底牌）
     $('setup-show-all').checked = s.mode ? !!s.showAll : false;
     $('setup-advice').checked = s.showAdvice !== false;
+    $('setup-review').checked = s.reviewBots !== false;
+    $('setup-rebuy').checked = s.allowRebuy !== false;
   } catch {
     /* 忽略 */
   }
@@ -97,7 +102,8 @@ function syncSetupMode(resetShowAll) {
   const mode = selectedMode();
   $('bot-options').classList.toggle('hidden', mode !== 'bot');
   $('hotseat-options').classList.toggle('hidden', mode !== 'hotseat');
-  $('setup-show-all-label').textContent = mode === 'bot' ? '训练用：显示电脑的底牌' : '训练模式：显示所有玩家的底牌';
+  $('setup-show-all-label').textContent = mode === 'bot' ? '训练用：始终显示电脑的底牌' : '训练模式：显示所有玩家的底牌';
+  $('setup-review-wrap').classList.toggle('hidden', mode !== 'bot');
   if (resetShowAll) $('setup-show-all').checked = mode === 'hotseat';
   document.querySelectorAll('.mode-card').forEach((el) => el.classList.toggle('selected', el.querySelector('input').checked));
 }
@@ -126,6 +132,8 @@ function readSetup() {
     difficulty: $('difficulty').value === 'easy' ? 'easy' : 'standard',
     botSpeed: Number($('bot-speed').value),
     showAdvice: $('setup-advice').checked,
+    reviewBots: $('setup-review').checked,
+    allowRebuy: $('setup-rebuy').checked,
   };
 }
 
@@ -137,6 +145,9 @@ function startGame(settings) {
   state.difficulty = settings.difficulty || 'standard';
   state.botSpeed = Number.isFinite(settings.botSpeed) ? settings.botSpeed : 700;
   state.showAdvice = settings.showAdvice !== false;
+  state.reviewBots = settings.reviewBots !== false;
+  state.reviewLogged = 0;
+  state.allowRebuy = settings.allowRebuy !== false;
   state.showAll = settings.showAll;
   state.equity = null;
   state.advice = null;
@@ -158,6 +169,7 @@ function startGame(settings) {
     bigBlind: settings.bigBlind,
     names,
     dealerSeat: state.mode === 'bot' ? Math.floor(Math.random() * settings.numPlayers) : 0,
+    allowRebuy: state.allowRebuy,
   });
   state.game.startHand();
   onStateChanged();
@@ -166,6 +178,8 @@ function startGame(settings) {
   $('show-all').checked = state.showAll;
   $('show-all-label').textContent = state.mode === 'bot' ? '显示电脑手牌' : '显示所有手牌';
   $('speed-wrap').classList.toggle('hidden', state.mode !== 'bot');
+  $('review-wrap').classList.toggle('hidden', state.mode !== 'bot');
+  $('review-bots').checked = state.reviewBots;
   $('speed').value = String(state.botSpeed);
   $('advice-panel').classList.toggle('hidden', !state.showAdvice);
   render();
@@ -244,6 +258,8 @@ function doAction(type, amount) {
 function nextHand() {
   const g = state.game;
   if (!g || g.phase !== 'handOver') return;
+  // 允许重新买入：电脑（自对弈模式下为所有玩家）输光后自动按平均筹码买入，保持满桌
+  if (state.allowRebuy) g.rebuyBusted((p) => state.mode === 'hotseat' || p.seat !== state.humanSeat);
   g.startHand();
   state.error = '';
   state.feedback = [];
@@ -251,25 +267,40 @@ function nextHand() {
   render();
 }
 
+/** 人类玩家输光后按平均筹码重新买入，并直接开始下一手 */
+function rebuyHuman() {
+  const g = state.game;
+  if (!g || state.mode !== 'bot' || !state.allowRebuy || g.phase !== 'handOver') return;
+  if (g.players[state.humanSeat].stack > 0) return;
+  g.rebuy(state.humanSeat);
+  nextHand();
+}
+
 // ---------- 渲染 ----------
 
-function holeVisible(p) {
-  const g = state.game;
-  if (p.out) return false;
-  if (state.showAll) return true;
-  if (state.mode === 'bot') return p.seat === state.humanSeat || !!g.result?.hands?.[p.seat];
-  if (g.phase === 'betting') return p.seat === g.toAct;
-  return !!g.result?.hands?.[p.seat]; // 摊牌时亮牌
+const visOpts = () => ({ mode: state.mode, humanSeat: state.humanSeat, showAll: state.showAll, reviewBots: state.reviewBots });
+const holeVisible = (p) => isHoleVisible(state.game, p.seat, visOpts());
+
+/** 一手结束后（开启复盘时）把电脑底牌写入日志，每手只写一次 */
+function logReviewIfNeeded(g) {
+  if (state.mode !== 'bot' || !state.reviewBots || g.phase === 'betting' || state.reviewLogged === g.handNumber) return;
+  state.reviewLogged = g.handNumber;
+  const seats = g.players.map((p) => p.seat).filter((s) => s !== state.humanSeat);
+  for (const text of reviewLogLines(buildHandReview(g, seats))) {
+    g.log.push({ hand: g.handNumber, street: 'review', kind: 'review', text });
+  }
 }
 
 function render() {
   const g = state.game;
   if (!g) return;
+  logReviewIfNeeded(g);
   renderTopbar(g);
   renderTable(g);
   renderActionPanel(g);
   renderAdvice(g);
   renderTraining(g);
+  renderStats(g);
   renderLog(g);
   scheduleEquity();
   scheduleBots();
@@ -297,7 +328,7 @@ function renderTable(g) {
     if (won && g.phase !== 'betting') classes.push('winner');
 
     let cards = '';
-    if (!p.out && p.holeCards.length) {
+    if (p.holeCards.length) {
       const vis = holeVisible(p);
       cards = p.holeCards.map((c) => cardHTML(c, { faceDown: !vis })).join('');
     }
@@ -322,6 +353,7 @@ function renderTable(g) {
       <div class="plate">
         <div class="name-row"><span class="name">${escapeHtml(p.name)}</span>${badges.join('')}</div>
         <div class="stack">${p.stack.toLocaleString('zh-CN')}</div>
+        ${netHTML(g, p)}
         <div class="status">${escapeHtml(status || '')}</div>
       </div>
       ${eq}${winBadge}
@@ -398,7 +430,11 @@ function renderActionPanel(g) {
         <div class="raise-row ${fixed ? 'fixed' : ''}">
           <div class="quick">
             <button class="btn small" data-to="${la.minRaiseTo}">最小</button>
-            ${BET_SIZES.map((b, i) => `<button class="btn small" data-size="${i}" title="${b.label}：到 ${potFractionTo(la, b.frac)}">${b.label.replace('（超池）', '')}</button>`).join('')}
+            ${
+              g.street === 'preflop'
+                ? preflopQuickSizes(g, la).map((o) => `<button class="btn small" data-to="${o.to}" title="到 ${o.to}">${o.label}</button>`).join('')
+                : BET_SIZES.map((b, i) => `<button class="btn small" data-size="${i}" title="${b.label}：到 ${potFractionTo(la, b.frac)}">${b.label.replace('（超池）', '')}</button>`).join('')
+            }
           </div>
           <div class="slider">
             <input id="raise-slider" type="range" min="${la.minRaiseTo}" max="${la.maxRaiseTo}" step="1" value="${v}" ${fixed ? 'disabled' : ''} aria-label="下注大小" />
@@ -434,13 +470,16 @@ function renderActionPanel(g) {
       })
       .join('');
   }
-  const busted = g.log.filter((e) => e.hand === g.handNumber && e.text.includes('出局')).map((e) => `<li class="muted">${escapeHtml(e.text)}</li>`).join('');
+  const busted = g.log.filter((e) => e.hand === g.handNumber && e.kind === 'info' && e.text.includes('出局')).map((e) => `<li class="muted">${escapeHtml(e.text)}</li>`).join('');
+  const review = reviewHTML(g);
   const humanOut = state.mode === 'bot' && g.players[state.humanSeat].out;
+  const canRebuy = humanOut && state.allowRebuy && g.phase === 'handOver';
   if (g.phase === 'gameOver') {
     const winnerName = g.players[g.winner]?.name ?? '';
     el.innerHTML = `
       <div class="ap-head"><span class="ap-turn">🏆 游戏结束：<b>${escapeHtml(winnerName)}</b> ${winnerName === '你' ? '赢得了全部筹码！' : '获胜'}</span></div>
       <ul class="ap-results">${lines}${busted}</ul>
+      ${review}
       <div class="ap-buttons">
         <button class="btn primary" data-act="restart">再来一局（相同设置）</button>
         <button class="btn ghost" data-act="setup">返回设置</button>
@@ -449,11 +488,28 @@ function renderActionPanel(g) {
     el.innerHTML = `
       <div class="ap-head"><span class="ap-turn">第 ${g.handNumber} 手结束</span>${humanOut ? '<span class="ap-meta">你已出局</span>' : ''}</div>
       <ul class="ap-results">${lines}${busted}</ul>
+      ${review}
       <div class="ap-buttons">
-        <button class="btn primary" data-act="next" autofocus>${humanOut ? '继续观看电脑对局 ▶' : '下一手 ▶'}</button>
+        ${canRebuy ? `<button class="btn primary" data-act="rebuy" autofocus>按平均筹码重新买入（${g.rebuyAmount()}）</button>` : ''}
+        <button class="btn ${canRebuy ? 'ghost' : 'primary'}" data-act="next" ${canRebuy ? '' : 'autofocus'}>${humanOut ? '继续观看电脑对局 ▶' : '下一手 ▶'}</button>
         ${humanOut ? '<button class="btn ghost" data-act="restart">再来一局</button>' : ''}
       </div>`;
   }
+}
+
+function reviewHTML(g) {
+  if (state.mode !== 'bot' || !state.reviewBots || g.phase === 'betting') return '';
+  const seats = g.players.map((p) => p.seat).filter((s) => s !== state.humanSeat);
+  const rows = buildHandReview(g, seats)
+    .map((r) => {
+      const status = r.folded ? `<span class="muted">${r.foldStreet}弃牌</span>` : r.won ? `<span class="win">赢 ${r.won}</span>` : '<span>摊牌</span>';
+      const hand = r.handName
+        ? `<span class="rv-hand">${r.boardComplete ? '' : '当前 '}${r.handName}</span>${r.best5 ? `<span class="mini">${r.best5.map((c) => cardHTML(c, { cls: 'xs' })).join('')}</span>` : ''}`
+        : '<span class="muted">未到翻牌</span>';
+      return `<div class="rv-row"><div class="rv-top"><b>${escapeHtml(r.name)}</b><span class="mini">${r.cards.map((c) => cardHTML(c, { cls: 'xs' })).join('')}</span>${status}${hand}</div><div class="rv-acts muted">${escapeHtml(r.actions)}</div></div>`;
+    })
+    .join('');
+  return rows ? `<details class="review" open><summary>本手复盘：电脑底牌</summary>${rows}</details>` : '';
 }
 
 function raiseLabel(la, v) {
@@ -637,12 +693,19 @@ function rangeGridHTML(tableKey, highlight) {
     <div class="rg-legend"><span class="lg raise"></span>加注 <span class="lg call"></span>跟注/过牌 <span class="lg fold"></span>弃牌</div>`;
 }
 
+function reasonsHTML(reasons) {
+  if (!reasons?.length) return '';
+  return `<div class="reasons"><div class="reasons-title">为什么</div><ul>${reasons.map((r) => `<li>${escapeHtml(r)}</li>`).join('')}</ul></div>`;
+}
+
 function feedbackHTML(g) {
   const list = state.feedback.filter((f) => f.hand === g.handNumber).slice(-3);
   if (!list.length) return '';
   return list
     .map(
-      (f) => `<div class="feedback ${f.verdict}"><b>${STREET_NAMES[f.street]}${state.mode === 'hotseat' ? ` · ${escapeHtml(f.seatName)}` : ''}：${f.label}</b><div>${escapeHtml(f.text)}</div></div>`,
+      (f) => `<div class="feedback ${f.verdict}"><b>${STREET_NAMES[f.street]}${state.mode === 'hotseat' ? ` · ${escapeHtml(f.seatName)}` : ''}：${f.label}</b><div>${escapeHtml(f.text)}</div>${
+        f.reasons?.length ? `<ul class="fb-reasons">${f.reasons.map((r) => `<li>${escapeHtml(r)}</li>`).join('')}</ul>` : ''
+      }</div>`,
     )
     .join('');
 }
@@ -674,7 +737,7 @@ function renderAdvice(g) {
         ${freqRow('弃牌', f.fold, 'fold')}
       </div>
       <div class="adv-primary">推荐：<b>${primaryText}</b>${f[adv.primary] < 0.99 ? '（混合策略：可按频率随机选择）' : ''}</div>
-      ${adv.notes.map((n) => `<div class="muted small">· ${escapeHtml(n)}</div>`).join('')}
+      ${reasonsHTML(adv.reasons)}
       <button class="btn small ghost" id="toggle-range">${state.showRange ? '收起范围图 ▴' : '查看本点位 13×13 范围图 ▾'}</button>
       ${state.showRange ? `<div class="muted small rg-title">${escapeHtml(adv.tableName)}</div>${rangeGridHTML(adv.tableKey, adv.handClass)}` : ''}
       <p class="adv-source">${escapeHtml(adv.source)}</p>
@@ -703,9 +766,32 @@ function renderAdvice(g) {
     <div class="adv-cat">${escapeHtml(adv.category)}</div>
     <div class="freqs">${rows}</div>
     <div class="adv-primary">推荐：<b>${adviceSummary(adv)}</b></div>
-    ${adv.notes.map((n) => `<div class="muted small">· ${escapeHtml(n)}</div>`).join('')}
+    ${reasonsHTML(adv.reasons)}
     <p class="adv-source">对手范围按其翻牌前动作从范围表推断，翻牌后为启发式规则（牌力、听牌、牌面、赔率、SPR、位置），${POSTFLOP_DISCLAIMER}。</p>
     ${fb ? `<p class="muted small">本手之前的决策：</p>${fb}` : ''}`;
+}
+
+const signed = (v) => (v > 0 ? `+${v.toLocaleString('zh-CN')}` : v.toLocaleString('zh-CN'));
+
+/** 座位上的净盈亏与买入次数 */
+function netHTML(g, p) {
+  const net = g.netProfit(p.seat);
+  const cls = net > 0 ? 'up' : net < 0 ? 'down' : '';
+  const re = p.rebuys ? ` · 买入×${p.rebuys + 1}` : '';
+  return `<div class="net ${cls}" title="净盈亏 = 筹码 − 累计买入（${p.buyIn}）">净 ${signed(net)}${re}</div>`;
+}
+
+/** 筹码统计：每个座位的重新买入次数、累计买入、净盈亏 */
+function renderStats(g) {
+  const rows = g.players
+    .map((p) => {
+      const net = g.netProfit(p.seat);
+      return `<tr class="${state.mode === 'bot' && p.seat === state.humanSeat ? 'me' : ''}"><td>${escapeHtml(p.name)}</td><td>${(p.stack + p.totalBet).toLocaleString('zh-CN')}</td><td>${p.rebuys}</td><td>${p.buyIn.toLocaleString('zh-CN')}</td><td class="${net > 0 ? 'up' : net < 0 ? 'down' : ''}">${signed(net)}</td></tr>`;
+    })
+    .join('');
+  const totalRebuys = g.players.reduce((s, p) => s + p.rebuys, 0);
+  $('stats').innerHTML = `<table class="stats-table"><thead><tr><th>玩家</th><th>筹码</th><th>重新买入</th><th>累计买入</th><th>净盈亏</th></tr></thead><tbody>${rows}</tbody></table>
+    <p class="muted small">桌面总筹码 ${g.totalChips.toLocaleString('zh-CN')} = 累计买入 ${g.totalBuyIn.toLocaleString('zh-CN')}（共重新买入 ${totalRebuys} 次）${state.allowRebuy ? '' : ' · 未开启重新买入'}</p>`;
 }
 
 function renderLog(g) {
@@ -761,6 +847,12 @@ function bindEvents() {
     }
   });
 
+  $('review-bots').addEventListener('change', (e) => {
+    state.reviewBots = e.target.checked;
+    if (state.settings) state.settings.reviewBots = state.reviewBots;
+    render();
+  });
+
   $('show-all').addEventListener('change', (e) => {
     state.showAll = e.target.checked;
     if (state.settings) state.settings.showAll = state.showAll;
@@ -779,6 +871,7 @@ function bindEvents() {
     if (btn.dataset.act) {
       const act = btn.dataset.act;
       if (act === 'next') nextHand();
+      else if (act === 'rebuy') rebuyHuman();
       else if (act === 'restart') startGame(state.settings);
       else if (act === 'setup') backToSetup();
       else if (act === 'raise') doAction(g.currentBet === 0 ? 'bet' : 'raise', state.raiseValue);
@@ -837,4 +930,4 @@ syncSetupMode(false);
 bindEvents();
 
 // 调试/自动化测试用
-window.__holdem = { state, startGame, doAction, nextHand, isHuman };
+window.__holdem = { rebuyHuman, state, startGame, doAction, nextHand, isHuman };
