@@ -1,7 +1,7 @@
 {
   "name": "texas-holdem-trainer",
-  "version": "0.1.0",
-  "description": "浏览器德州扑克自对弈训练器（纯前端，无需构建）",
+  "version": "0.2.0",
+  "description": "浏览器德州扑克训练器：人机对战 6人桌 + 自对弈，GTO 风格建议（纯前端，无需构建）",
   "private": true,
   "type": "module",
   "scripts": {

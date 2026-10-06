@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>德州扑克训练器 · Texas Hold'em Trainer</title>
-  <meta name="description" content="浏览器里的德州扑克自对弈训练器：一个人操控所有座位，显示真实胜率、底池赔率与牌型。" />
+  <meta name="description" content="浏览器里的德州扑克训练器：人机对战 6人桌与自对弈，GTO 风格建议、胜率、底池赔率与牌型。" />
   <meta name="theme-color" content="#0c1218" />
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>♠</text></svg>" />
   <link rel="stylesheet" href="css/style.css" />
@@ -18,13 +18,49 @@
         <h1><span class="logo">♠♥</span> 德州扑克训练器</h1>
         <p class="subtitle">一个人操控牌桌上的所有座位，自己和自己对局，练习每一个决策。</p>
         <form id="setup-form" novalidate>
-          <div class="form-grid">
+          <div class="mode-select" role="radiogroup" aria-label="游戏模式">
+            <label class="mode-card">
+              <input type="radio" name="mode" value="bot" checked />
+              <b>🤖 人机对战 6人桌</b>
+              <span>你控制一个座位，另外 5 个座位由电脑操控，附带 GTO 风格建议</span>
+            </label>
+            <label class="mode-card">
+              <input type="radio" name="mode" value="hotseat" />
+              <b>👥 自对弈（热座）</b>
+              <span>一个人操控所有座位（2–9 人），练习每个位置的决策</span>
+            </label>
+          </div>
+          <div class="form-grid" id="bot-options">
+            <label>你的座位
+              <select id="human-seat">
+                <option value="0" selected>座位 1</option><option value="1">座位 2</option><option value="2">座位 3</option>
+                <option value="3">座位 4</option><option value="4">座位 5</option><option value="5">座位 6</option>
+              </select>
+            </label>
+            <label>电脑难度
+              <select id="difficulty">
+                <option value="standard" selected>标准</option>
+                <option value="easy">简单</option>
+              </select>
+            </label>
+            <label>电脑速度
+              <select id="bot-speed">
+                <option value="1200">慢</option>
+                <option value="700" selected>正常</option>
+                <option value="300">快</option>
+                <option value="0">瞬间</option>
+              </select>
+            </label>
+          </div>
+          <div class="form-grid hidden" id="hotseat-options">
             <label>玩家人数
               <select id="num-players">
                 <option>2</option><option>3</option><option>4</option><option>5</option>
                 <option selected>6</option><option>7</option><option>8</option><option>9</option>
               </select>
             </label>
+          </div>
+          <div class="form-grid">
             <label>初始筹码
               <input id="starting-stack" type="number" min="1" step="1" value="1000" inputmode="numeric" />
             </label>
@@ -36,8 +72,12 @@
             </label>
           </div>
           <label class="check">
-            <input id="setup-show-all" type="checkbox" checked />
-            训练模式：显示所有玩家的手牌
+            <input id="setup-show-all" type="checkbox" />
+            <span id="setup-show-all-label">训练用：显示电脑的底牌</span>
+          </label>
+          <label class="check tight">
+            <input id="setup-advice" type="checkbox" checked />
+            <span>显示 GTO 风格建议与决策反馈</span>
           </label>
           <p id="setup-error" class="error" role="alert"></p>
           <button type="submit" class="btn primary big">开始游戏</button>
@@ -45,7 +85,9 @@
         <details class="howto">
           <summary>玩法说明</summary>
           <ul>
-            <li>座位依次命名为 玩家1、玩家2 …，轮到谁行动，谁的座位就会高亮，由你替他做决定。</li>
+            <li><b>人机对战</b>：你坐在选定的座位（显示为“你”），其余 5 位电脑按位置范围表与翻牌后启发式策略自动行动。电脑底牌在摊牌前隐藏（可在顶栏打开显示）。</li>
+            <li><b>自对弈</b>：座位依次命名为 玩家1、玩家2 …，轮到谁行动谁的座位就会高亮，由你替他做决定。</li>
+            <li><b>GTO 建议</b>：翻牌前给出范围表中的推荐频率（如 加注 70% / 弃牌 30%）和 13×13 范围图；翻牌后给出近似建议（非求解器结果）。行动后会提示你的选择是否符合。</li>
             <li>行动按钮：弃牌 / 过牌 / 跟注 / 下注 / 加注 / 全下。用滑杆或快捷按钮（1/2 池、2/3 池、底池）选择下注大小。</li>
             <li>右侧“训练辅助”显示当前行动玩家的牌型、对其他在局玩家<b>真实手牌</b>的胜率，以及跟注所需的底池赔率。</li>
             <li>关闭“显示所有手牌”后，只显示正在行动的玩家的底牌，适合模拟真实信息。</li>
@@ -63,9 +105,15 @@
           <span id="hand-info" class="tb-info"></span>
         </div>
         <div class="tb-right">
-          <label class="toggle" title="训练模式：显示所有玩家的底牌">
+          <label class="toggle hidden" id="speed-wrap" title="电脑行动速度">
+            <span>速度</span>
+            <select id="speed">
+              <option value="1200">慢</option><option value="700">正常</option><option value="300">快</option><option value="0">瞬间</option>
+            </select>
+          </label>
+          <label class="toggle" title="训练用：显示底牌">
             <input id="show-all" type="checkbox" checked />
-            <span>显示所有手牌</span>
+            <span id="show-all-label">显示所有手牌</span>
           </label>
           <button id="new-game" class="btn small ghost">新游戏</button>
         </div>
@@ -86,6 +134,7 @@
           <div id="action-panel" class="panel action-panel"></div>
         </div>
         <aside class="side-col">
+          <div id="advice-panel" class="panel advice-panel"></div>
           <div id="training-panel" class="panel training-panel"></div>
           <details class="panel log-panel" id="log-details" open>
             <summary>牌局日志</summary>

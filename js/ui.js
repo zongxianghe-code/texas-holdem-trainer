@@ -4,6 +4,10 @@ import { HoldemGame, STREET_NAMES } from './engine.js';
 import { describeHand } from './evaluator.js';
 import { calcEquity } from './equity.js';
 import { RANK_LABELS, SUIT_SYMBOLS, rankOf, suitOf, isRed } from './cards.js';
+import { decideBotAction, legalize } from './bot.js';
+import { getAdvice, evaluateDecision, adviceSummary, POSTFLOP_DISCLAIMER } from './advice.js';
+import { getTable, gridHand } from './ranges.js';
+import { BET_SIZES, potFractionTo, sizeLabel } from './strategy.js';
 
 const EQUITY_ITERATIONS = 3000;
 const SETTINGS_KEY = 'holdem-trainer-settings';
@@ -13,6 +17,16 @@ const $ = (id) => document.getElementById(id);
 const state = {
   game: null,
   settings: null,
+  mode: 'bot', // bot | hotseat
+  humanSeat: 0,
+  difficulty: 'standard',
+  botSpeed: 700,
+  showAdvice: true,
+  showRange: false,
+  advice: null, // { key, data }
+  feedback: [], // 本手的决策反馈
+  botTimer: 0,
+  botKey: '',
   showAll: true,
   raiseValue: 0,
   error: '',
@@ -58,18 +72,39 @@ function loadSettings() {
   try {
     const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null');
     if (!s) return;
-    $('num-players').value = String(s.numPlayers);
+    const radio = document.querySelector(`input[name=mode][value=${s.mode === 'hotseat' ? 'hotseat' : 'bot'}]`);
+    if (radio) radio.checked = true;
+    if (s.numPlayers) $('num-players').value = String(s.numPlayers);
+    if (s.humanSeat !== undefined) $('human-seat').value = String(s.humanSeat);
+    if (s.difficulty) $('difficulty').value = s.difficulty;
+    if (s.botSpeed !== undefined) $('bot-speed').value = String(s.botSpeed);
     $('starting-stack').value = s.startingStack;
     $('small-blind').value = s.smallBlind;
     $('big-blind').value = s.bigBlind;
-    $('setup-show-all').checked = s.showAll !== false;
+    // v0.1 保存的设置没有 mode 字段：沿用新的默认值（人机模式默认隐藏电脑底牌）
+    $('setup-show-all').checked = s.mode ? !!s.showAll : false;
+    $('setup-advice').checked = s.showAdvice !== false;
   } catch {
     /* 忽略 */
   }
 }
 
+function selectedMode() {
+  return document.querySelector('input[name=mode]:checked')?.value === 'hotseat' ? 'hotseat' : 'bot';
+}
+
+function syncSetupMode(resetShowAll) {
+  const mode = selectedMode();
+  $('bot-options').classList.toggle('hidden', mode !== 'bot');
+  $('hotseat-options').classList.toggle('hidden', mode !== 'hotseat');
+  $('setup-show-all-label').textContent = mode === 'bot' ? '训练用：显示电脑的底牌' : '训练模式：显示所有玩家的底牌';
+  if (resetShowAll) $('setup-show-all').checked = mode === 'hotseat';
+  document.querySelectorAll('.mode-card').forEach((el) => el.classList.toggle('selected', el.querySelector('input').checked));
+}
+
 function readSetup() {
-  const numPlayers = Number($('num-players').value);
+  const mode = selectedMode();
+  const numPlayers = mode === 'bot' ? 6 : Number($('num-players').value);
   const startingStack = Number($('starting-stack').value);
   const smallBlind = Number($('small-blind').value);
   const bigBlind = Number($('big-blind').value);
@@ -80,37 +115,102 @@ function readSetup() {
   if (!isInt(smallBlind) || !isInt(bigBlind)) throw new Error('盲注必须是正整数');
   if (smallBlind > bigBlind) throw new Error('小盲不能大于大盲');
   if (bigBlind > startingStack) throw new Error('大盲不能超过初始筹码');
-  return { numPlayers, startingStack, smallBlind, bigBlind, showAll };
+  return {
+    mode,
+    numPlayers,
+    startingStack,
+    smallBlind,
+    bigBlind,
+    showAll,
+    humanSeat: Number($('human-seat').value) || 0,
+    difficulty: $('difficulty').value === 'easy' ? 'easy' : 'standard',
+    botSpeed: Number($('bot-speed').value),
+    showAdvice: $('setup-advice').checked,
+  };
 }
 
 function startGame(settings) {
+  stopBots();
   state.settings = settings;
+  state.mode = settings.mode || 'hotseat';
+  state.humanSeat = Math.min(settings.humanSeat || 0, settings.numPlayers - 1);
+  state.difficulty = settings.difficulty || 'standard';
+  state.botSpeed = Number.isFinite(settings.botSpeed) ? settings.botSpeed : 700;
+  state.showAdvice = settings.showAdvice !== false;
   state.showAll = settings.showAll;
   state.equity = null;
+  state.advice = null;
+  state.feedback = [];
   state.error = '';
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
   } catch {
     /* 忽略 */
   }
+  const names =
+    state.mode === 'bot'
+      ? Array.from({ length: settings.numPlayers }, (_, i) => (i === state.humanSeat ? '你' : `电脑${i + 1}`))
+      : undefined;
   state.game = new HoldemGame({
     numPlayers: settings.numPlayers,
     startingStack: settings.startingStack,
     smallBlind: settings.smallBlind,
     bigBlind: settings.bigBlind,
+    names,
+    dealerSeat: state.mode === 'bot' ? Math.floor(Math.random() * settings.numPlayers) : 0,
   });
   state.game.startHand();
   onStateChanged();
   $('setup-screen').classList.add('hidden');
   $('game-screen').classList.remove('hidden');
   $('show-all').checked = state.showAll;
+  $('show-all-label').textContent = state.mode === 'bot' ? '显示电脑手牌' : '显示所有手牌';
+  $('speed-wrap').classList.toggle('hidden', state.mode !== 'bot');
+  $('speed').value = String(state.botSpeed);
+  $('advice-panel').classList.toggle('hidden', !state.showAdvice);
   render();
 }
 
 function backToSetup() {
+  stopBots();
   state.game = null;
   $('game-screen').classList.add('hidden');
   $('setup-screen').classList.remove('hidden');
+}
+
+const isHuman = (seat) => state.mode === 'hotseat' || seat === state.humanSeat;
+const decisionKey = (g) => `${g.handNumber}|${g.log.length}|${g.toAct}`;
+
+// ---------- 电脑玩家 ----------
+
+function stopBots() {
+  clearTimeout(state.botTimer);
+  state.botTimer = 0;
+  state.botKey = '';
+}
+
+function scheduleBots() {
+  const g = state.game;
+  if (!g || state.mode !== 'bot' || g.phase !== 'betting' || isHuman(g.toAct)) {
+    stopBots();
+    return;
+  }
+  const key = decisionKey(g);
+  if (state.botKey === key && state.botTimer) return; // 已经在等待这一步
+  clearTimeout(state.botTimer);
+  state.botKey = key;
+  state.botTimer = setTimeout(() => {
+    state.botTimer = 0;
+    if (state.game !== g || g.phase !== 'betting' || isHuman(g.toAct) || decisionKey(g) !== key) return;
+    try {
+      g.act(decideBotAction(g, { difficulty: state.difficulty }));
+    } catch (e) {
+      console.warn('电脑决策异常，改为保守动作：', e);
+      g.act(legalize({ type: 'check' }, g.getLegalActions()));
+    }
+    onStateChanged();
+    render();
+  }, state.botSpeed);
 }
 
 // ---------- 动作 ----------
@@ -122,9 +222,17 @@ function onStateChanged() {
 
 function doAction(type, amount) {
   const g = state.game;
-  if (!g || g.phase !== 'betting') return;
+  if (!g || g.phase !== 'betting' || !isHuman(g.toAct)) return;
+  const advice = state.showAdvice ? currentAdvice(g) : null;
+  const seatName = g.players[g.toAct].name;
+  const street = g.street;
   try {
+    const la = g.getLegalActions();
     g.act({ type, amount });
+    if (advice) {
+      const fb = evaluateDecision(advice, { type, amount: type === 'allin' ? la.maxRaiseTo : amount });
+      state.feedback.push({ ...fb, street, seatName, hand: g.handNumber });
+    }
     state.error = '';
     onStateChanged();
   } catch (e) {
@@ -138,15 +246,9 @@ function nextHand() {
   if (!g || g.phase !== 'handOver') return;
   g.startHand();
   state.error = '';
+  state.feedback = [];
   onStateChanged();
   render();
-}
-
-/** 按底池比例计算“下注到”的金额 */
-function potSizedTo(la, frac) {
-  const owe = la.currentBet - la.bet;
-  const target = Math.round(la.currentBet + frac * (la.pot + owe));
-  return Math.max(la.minRaiseTo, Math.min(la.maxRaiseTo, target));
 }
 
 // ---------- 渲染 ----------
@@ -155,6 +257,7 @@ function holeVisible(p) {
   const g = state.game;
   if (p.out) return false;
   if (state.showAll) return true;
+  if (state.mode === 'bot') return p.seat === state.humanSeat || !!g.result?.hands?.[p.seat];
   if (g.phase === 'betting') return p.seat === g.toAct;
   return !!g.result?.hands?.[p.seat]; // 摊牌时亮牌
 }
@@ -165,14 +268,17 @@ function render() {
   renderTopbar(g);
   renderTable(g);
   renderActionPanel(g);
+  renderAdvice(g);
   renderTraining(g);
   renderLog(g);
   scheduleEquity();
+  scheduleBots();
 }
 
 function renderTopbar(g) {
   const alive = g.players.filter((p) => !p.out).length;
-  $('hand-info').textContent = `第 ${g.handNumber} 手 · 盲注 ${g.smallBlind}/${g.bigBlind} · 剩余 ${alive} 人`;
+  const mode = state.mode === 'bot' ? `人机 · ${state.difficulty === 'easy' ? '简单' : '标准'}` : '自对弈';
+  $('hand-info').textContent = `${mode} · 第 ${g.handNumber} 手 · 盲注 ${g.smallBlind}/${g.bigBlind} · 剩余 ${alive} 人`;
 }
 
 function renderTable(g) {
@@ -203,6 +309,8 @@ function renderTable(g) {
     const handInfo = result?.hands?.[p.seat];
     if (g.phase !== 'betting' && handInfo) status = handInfo.name;
     if (p.out) status = '出局';
+    if (state.mode === 'bot' && g.phase === 'betting' && p.seat === g.toAct && !isHuman(p.seat)) status = '思考中…';
+    if (state.mode === 'bot' && p.seat === state.humanSeat) classes.push('human');
 
     const eq = showEq && state.equity.bySeat[p.seat] !== undefined && !p.folded
       ? `<div class="eq-badge" title="胜率">${pct(state.equity.bySeat[p.seat], 0)}</div>`
@@ -269,6 +377,14 @@ function renderTable(g) {
 
 function renderActionPanel(g) {
   const el = $('action-panel');
+  if (g.phase === 'betting' && !isHuman(g.toAct)) {
+    const p = g.players[g.toAct];
+    const human = g.players[state.humanSeat];
+    el.innerHTML = `
+      <div class="ap-head"><span class="ap-turn"><span class="spinner"></span> <b>${escapeHtml(p.name)}</b> 思考中…</span>
+      <span class="ap-meta">${human.out ? '你已出局，正在观看电脑对局' : human.folded ? '你已弃牌，等待本手结束' : '等待电脑行动'}</span></div>`;
+    return;
+  }
   if (g.phase === 'betting') {
     const la = g.getLegalActions();
     const p = g.players[g.toAct];
@@ -282,9 +398,7 @@ function renderActionPanel(g) {
         <div class="raise-row ${fixed ? 'fixed' : ''}">
           <div class="quick">
             <button class="btn small" data-to="${la.minRaiseTo}">最小</button>
-            <button class="btn small" data-frac="0.5">1/2 池</button>
-            <button class="btn small" data-frac="0.6667">2/3 池</button>
-            <button class="btn small" data-frac="1">底池</button>
+            ${BET_SIZES.map((b, i) => `<button class="btn small" data-size="${i}" title="${b.label}：到 ${potFractionTo(la, b.frac)}">${b.label.replace('（超池）', '')}</button>`).join('')}
           </div>
           <div class="slider">
             <input id="raise-slider" type="range" min="${la.minRaiseTo}" max="${la.maxRaiseTo}" step="1" value="${v}" ${fixed ? 'disabled' : ''} aria-label="下注大小" />
@@ -321,9 +435,11 @@ function renderActionPanel(g) {
       .join('');
   }
   const busted = g.log.filter((e) => e.hand === g.handNumber && e.text.includes('出局')).map((e) => `<li class="muted">${escapeHtml(e.text)}</li>`).join('');
+  const humanOut = state.mode === 'bot' && g.players[state.humanSeat].out;
   if (g.phase === 'gameOver') {
+    const winnerName = g.players[g.winner]?.name ?? '';
     el.innerHTML = `
-      <div class="ap-head"><span class="ap-turn">🏆 游戏结束：<b>${escapeHtml(g.players[g.winner]?.name ?? '')}</b> 获胜</span></div>
+      <div class="ap-head"><span class="ap-turn">🏆 游戏结束：<b>${escapeHtml(winnerName)}</b> ${winnerName === '你' ? '赢得了全部筹码！' : '获胜'}</span></div>
       <ul class="ap-results">${lines}${busted}</ul>
       <div class="ap-buttons">
         <button class="btn primary" data-act="restart">再来一局（相同设置）</button>
@@ -331,10 +447,11 @@ function renderActionPanel(g) {
       </div>`;
   } else {
     el.innerHTML = `
-      <div class="ap-head"><span class="ap-turn">第 ${g.handNumber} 手结束</span></div>
+      <div class="ap-head"><span class="ap-turn">第 ${g.handNumber} 手结束</span>${humanOut ? '<span class="ap-meta">你已出局</span>' : ''}</div>
       <ul class="ap-results">${lines}${busted}</ul>
       <div class="ap-buttons">
-        <button class="btn primary" data-act="next" autofocus>下一手 ▶</button>
+        <button class="btn primary" data-act="next" autofocus>${humanOut ? '继续观看电脑对局 ▶' : '下一手 ▶'}</button>
+        ${humanOut ? '<button class="btn ghost" data-act="restart">再来一局</button>' : ''}
       </div>`;
   }
 }
@@ -367,6 +484,7 @@ function equityKey(g) {
 function scheduleEquity() {
   const g = state.game;
   if (!g || g.phase !== 'betting') return;
+  if (state.mode === 'bot' && !state.showAll) return; // 人机模式不泄露电脑底牌
   const key = equityKey(g);
   if (state.equity?.key === key) return;
   clearTimeout(state.equityTimer);
@@ -399,17 +517,40 @@ function renderTraining(g) {
     }`;
     return;
   }
+  if (state.mode === 'bot' && !isHuman(g.toAct)) {
+    const h = g.players[state.humanSeat];
+    const mine = !h.out && h.holeCards.length ? describeHand([...h.holeCards, ...g.board]).name : '—';
+    el.innerHTML = `<h3>训练辅助</h3>
+      <div class="stat"><span>你的当前牌型</span><b>${h.folded || h.out ? '（已弃牌）' : mine}</b></div>
+      <div class="stat"><span>底池</span><b>${g.pot}</b></div>
+      <p class="muted small">轮到你行动时显示胜率与底池赔率。</p>`;
+    return;
+  }
   const p = g.players[g.toAct];
   const la = g.getLegalActions();
   const hand = describeHand([...p.holeCards, ...g.board]);
-  const eqReady = state.equity?.key === equityKey(g);
-  const myEq = eqReady ? state.equity.bySeat[p.seat] : null;
+  const trueEqAllowed = state.mode !== 'bot' || state.showAll;
+  const eqReady = trueEqAllowed && state.equity?.key === equityKey(g);
+  let myEq = eqReady ? state.equity.bySeat[p.seat] : null;
   const opponents = g.players.filter((q) => !q.out && !q.folded && q !== p).length;
-  const method = eqReady
+  let myEqLabel = `胜率（对 ${opponents} 名对手的实际手牌）`;
+  let methodOverride = null;
+  if (!trueEqAllowed) {
+    // 人机模式且不显示电脑底牌：只用对“估计范围”的胜率（来自建议模块）
+    const adv = state.showAdvice ? currentAdvice(g) : null;
+    myEqLabel = `胜率（对 ${opponents} 名对手的估计范围）`;
+    if (adv && adv.street !== 'preflop') {
+      myEq = adv.equity;
+      methodOverride = '按对手翻牌前动作推断范围，蒙特卡洛估计（不读取电脑底牌）';
+    } else {
+      methodOverride = adv ? `起手牌强度约前 ${Math.max(1, Math.round(adv.percentile * 100))}%（翻牌前不计算范围胜率）` : '打开“显示电脑手牌”可查看真实胜率';
+    }
+  }
+  const method = methodOverride ?? (eqReady
     ? state.equity.exact
       ? `精确枚举 ${state.equity.samples.toLocaleString('zh-CN')} 种发牌`
       : `蒙特卡洛模拟 ${state.equity.samples.toLocaleString('zh-CN')} 次`
-    : '计算中…';
+    : '计算中…');
 
   // 底池赔率（简化：只考虑当前底池中该玩家可赢得的部分，不计后续下注）
   let oddsHtml = '';
@@ -450,11 +591,121 @@ function renderTraining(g) {
     <h3>训练辅助 · ${escapeHtml(p.name)}</h3>
     <div class="stat"><span>当前牌型</span><b>${hand.name}</b></div>
     ${g.board.length >= 3 ? `<div class="mini best5">${hand.best5.map((c) => cardHTML(c, { cls: 'xs' })).join('')}</div>` : ''}
-    <div class="stat"><span>胜率（对 ${opponents} 名对手的实际手牌）</span><b class="eq-main">${myEq === null ? '…' : pct(myEq)}</b></div>
+    <div class="stat"><span>${myEqLabel}</span><b class="eq-main">${myEq === null ? '—' : pct(myEq)}</b></div>
     <div class="muted small">${method}</div>
     <div class="stat"><span>底池</span><b>${g.pot}</b></div>
     ${oddsHtml}
     ${eqTable}`;
+}
+
+// ---------- GTO 建议 ----------
+
+function currentAdvice(g) {
+  if (!g || g.phase !== 'betting' || !isHuman(g.toAct)) return null;
+  const key = decisionKey(g);
+  if (state.advice?.key !== key) {
+    try {
+      state.advice = { key, data: getAdvice(g, g.toAct) };
+    } catch (e) {
+      console.warn('建议计算失败', e);
+      state.advice = { key, data: null };
+    }
+  }
+  return state.advice.data;
+}
+
+function freqRow(label, freq, cls, sub = '') {
+  return `<div class="freq-row ${cls}"><span class="fr-label">${label}${sub ? `<small>${sub}</small>` : ''}</span>
+    <div class="fr-bar"><i style="width:${(freq * 100).toFixed(1)}%"></i></div><b>${Math.round(freq * 100)}%</b></div>`;
+}
+
+function rangeGridHTML(tableKey, highlight) {
+  const table = getTable(tableKey);
+  let cells = '';
+  for (let r = 0; r < 13; r++) {
+    for (let c = 0; c < 13; c++) {
+      const h = gridHand(r, c);
+      const f = table.get(h);
+      const a = f.raise * 100;
+      const b = a + f.call * 100;
+      const bg = `linear-gradient(to right, var(--rg-raise) 0 ${a}%, var(--rg-call) ${a}% ${b}%, var(--rg-fold) ${b}% 100%)`;
+      const title = `${h}：加注 ${Math.round(f.raise * 100)}% / 跟注 ${Math.round(f.call * 100)}% / 弃牌 ${Math.round(f.fold * 100)}%`;
+      cells += `<div class="rg-cell${h === highlight ? ' me' : ''}" style="background:${bg}" title="${title}">${h}</div>`;
+    }
+  }
+  return `<div class="range-grid">${cells}</div>
+    <div class="rg-legend"><span class="lg raise"></span>加注 <span class="lg call"></span>跟注/过牌 <span class="lg fold"></span>弃牌</div>`;
+}
+
+function feedbackHTML(g) {
+  const list = state.feedback.filter((f) => f.hand === g.handNumber).slice(-3);
+  if (!list.length) return '';
+  return list
+    .map(
+      (f) => `<div class="feedback ${f.verdict}"><b>${STREET_NAMES[f.street]}${state.mode === 'hotseat' ? ` · ${escapeHtml(f.seatName)}` : ''}：${f.label}</b><div>${escapeHtml(f.text)}</div></div>`,
+    )
+    .join('');
+}
+
+function renderAdvice(g) {
+  const el = $('advice-panel');
+  if (!state.showAdvice) return;
+  const fb = feedbackHTML(g);
+  const adv = currentAdvice(g);
+  if (!adv) {
+    let waiting = '';
+    if (g.phase === 'betting') waiting = `<p class="muted small">等待 ${escapeHtml(g.players[g.toAct].name)} 行动…</p>`;
+    else waiting = '<p class="muted small">轮到你行动时会显示建议。</p>';
+    el.innerHTML = `<h3>GTO 建议</h3>${fb ? `<p class="muted small">本手你的决策：</p>${fb}` : ''}${waiting}`;
+    return;
+  }
+  const who = state.mode === 'hotseat' ? ` · ${escapeHtml(g.players[adv.seat].name)}` : '';
+  if (adv.street === 'preflop') {
+    const f = adv.freqs;
+    const raiseSub = adv.raiseTo ? adv.sizeText : '';
+    const primaryText = adv.primary === 'raise' && adv.raiseTo ? `${adv.names.raise} ${adv.sizeText}` : adv.names[adv.primary];
+    el.innerHTML = `
+      <h3>GTO 建议${who} <span class="tag">翻牌前 · 范围表</span></h3>
+      <div class="adv-line"><span class="muted">位置</span> ${escapeHtml(adv.positionText)} · ${escapeHtml(adv.spotText)}</div>
+      <div class="adv-line"><span class="muted">手牌</span> <b class="hc">${adv.handClass}</b> ${adv.handCategory} · 约前 ${Math.max(1, Math.round(adv.percentile * 100))}%</div>
+      <div class="freqs">
+        ${freqRow(adv.names.raise, f.raise, 'raise', raiseSub)}
+        ${freqRow(adv.names.call, f.call, 'call')}
+        ${freqRow('弃牌', f.fold, 'fold')}
+      </div>
+      <div class="adv-primary">推荐：<b>${primaryText}</b>${f[adv.primary] < 0.99 ? '（混合策略：可按频率随机选择）' : ''}</div>
+      ${adv.notes.map((n) => `<div class="muted small">· ${escapeHtml(n)}</div>`).join('')}
+      <button class="btn small ghost" id="toggle-range">${state.showRange ? '收起范围图 ▴' : '查看本点位 13×13 范围图 ▾'}</button>
+      ${state.showRange ? `<div class="muted small rg-title">${escapeHtml(adv.tableName)}</div>${rangeGridHTML(adv.tableKey, adv.handClass)}` : ''}
+      <p class="adv-source">${escapeHtml(adv.source)}</p>
+      ${fb ? `<p class="muted small">本手之前的决策：</p>${fb}` : ''}`;
+    return;
+  }
+  const rows = adv.actions
+    .map((a) => {
+      let label;
+      if (a.kind === 'bet') label = `下注 ${sizeLabel(a.size).replace('（超池）', '')}`;
+      else if (a.kind === 'raise') label = `加注 ${sizeLabel(a.size).replace('（超池）', '')}`;
+      else if (a.kind === 'check') label = '过牌';
+      else if (a.kind === 'call') label = '跟注';
+      else label = '弃牌';
+      const cls = a.kind === 'bet' || a.kind === 'raise' ? 'raise' : a.kind === 'fold' ? 'fold' : 'call';
+      return freqRow(label, a.freq, cls, a.to ? `到 ${a.to}` : '');
+    })
+    .join('');
+  el.innerHTML = `
+    <h3>GTO 建议${who} <span class="tag warn">${POSTFLOP_DISCLAIMER}</span></h3>
+    <div class="adv-line"><span class="muted">牌型</span> ${escapeHtml(adv.handText)}</div>
+    <div class="adv-line"><span class="muted">听牌</span> ${escapeHtml(adv.drawText)}</div>
+    <div class="adv-line"><span class="muted">牌面</span> ${escapeHtml(adv.textureText)}</div>
+    <div class="adv-line"><span class="muted">局面</span> ${adv.inPosition ? '有位置' : '无位置'} · ${adv.isPFR ? '翻牌前进攻者' : '翻牌前跟注方'} · SPR ${adv.spr.toFixed(1)}</div>
+    <div class="adv-line"><span class="muted">对估计范围胜率</span> <b>${pct(adv.equity)}</b>${adv.toCall > 0 ? ` · 需要 ${pct(adv.need)}` : ''}</div>
+    <div class="adv-cat">${escapeHtml(adv.category)}</div>
+    <div class="freqs">${rows}</div>
+    <div class="adv-primary">推荐：<b>${adviceSummary(adv)}</b></div>
+    ${adv.notes.map((n) => `<div class="muted small">· ${escapeHtml(n)}</div>`).join('')}
+    <p class="adv-source">对手范围按其翻牌前动作从范围表推断，翻牌后为启发式规则（牌力、听牌、牌面、赔率、SPR、位置），${POSTFLOP_DISCLAIMER}。</p>
+    ${fb ? `<p class="muted small">本手之前的决策：</p>${fb}` : ''}`;
 }
 
 function renderLog(g) {
@@ -489,6 +740,27 @@ function bindEvents() {
     }
   });
 
+  document.querySelectorAll('input[name=mode]').forEach((r) => r.addEventListener('change', () => syncSetupMode(true)));
+  $('speed').addEventListener('change', (e) => {
+    state.botSpeed = Number(e.target.value);
+    if (state.settings) {
+      state.settings.botSpeed = state.botSpeed;
+      try {
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
+      } catch {
+        /* 忽略 */
+      }
+    }
+    stopBots();
+    scheduleBots();
+  });
+  $('advice-panel').addEventListener('click', (e) => {
+    if (e.target.closest('#toggle-range')) {
+      state.showRange = !state.showRange;
+      renderAdvice(state.game);
+    }
+  });
+
   $('show-all').addEventListener('change', (e) => {
     state.showAll = e.target.checked;
     if (state.settings) state.settings.showAll = state.showAll;
@@ -515,7 +787,7 @@ function bindEvents() {
     }
     const la = g?.getLegalActions();
     if (!la) return;
-    if (btn.dataset.frac) setRaiseValue(potSizedTo(la, Number(btn.dataset.frac)), la);
+    if (btn.dataset.size !== undefined) setRaiseValue(potFractionTo(la, BET_SIZES[Number(btn.dataset.size)].frac), la);
     else if (btn.dataset.to) setRaiseValue(Number(btn.dataset.to), la);
   });
   panel.addEventListener('input', (e) => {
@@ -545,7 +817,7 @@ function bindEvents() {
       nextHand();
       return;
     }
-    if (g.phase !== 'betting' || typing) return;
+    if (g.phase !== 'betting' || typing || !isHuman(g.toAct)) return;
     const la = g.getLegalActions();
     const k = e.key.toLowerCase();
     if (k === 'f') doAction('fold');
@@ -561,7 +833,8 @@ function bindEvents() {
 }
 
 loadSettings();
+syncSetupMode(false);
 bindEvents();
 
 // 调试/自动化测试用
-window.__holdem = { state, startGame, doAction, nextHand };
+window.__holdem = { state, startGame, doAction, nextHand, isHuman };

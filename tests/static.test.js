@@ -32,3 +32,11 @@ test('纯逻辑模块可以在无 DOM 环境中导入', async () => {
     assert.ok(Object.keys(mod).length > 0);
   }
 });
+
+test('快捷下注按钮只有 1/3、1/2、2/3、4/3 底池（以及最小、全下）', () => {
+  const ui = readFileSync(join(root, 'js', 'ui.js'), 'utf8');
+  assert.match(ui, /BET_SIZES\.map\(/);
+  assert.doesNotMatch(ui, /data-frac/);
+  assert.doesNotMatch(ui, />底池<\/button>/);
+  assert.match(ui, /data-to="\$\{la\.minRaiseTo\}">最小</);
+});
