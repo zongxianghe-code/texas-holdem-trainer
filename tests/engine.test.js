@@ -285,14 +285,18 @@ test('非法动作会被拒绝', () => {
   assert.throws(() => new HoldemGame({ smallBlind: 20, bigBlind: 10 }));
 });
 
-test('随机对局压力测试：筹码守恒、状态一致', () => {
+test('随机对局压力测试：筹码守恒（含重新买入）、状态一致', () => {
   const rng = mulberry32(2026);
   for (let game = 0; game < 40; game++) {
     const n = 2 + (game % 8);
-    const g = new HoldemGame({ numPlayers: n, startingStack: 200 + Math.floor(rng() * 800), smallBlind: 5, bigBlind: 10, rng });
-    const total = g.totalChips;
+    const allowRebuy = game % 3 === 0;
+    const g = new HoldemGame({ numPlayers: n, startingStack: 200 + Math.floor(rng() * 800), smallBlind: 5, bigBlind: 10, rng, allowRebuy });
+    let total = g.totalChips; // 初始筹码 + 重新买入
     let hands = 0;
-    while (g.phase !== 'gameOver' && hands < 150) {
+    // 随机全下 + 按平均筹码买入会让总筹码几何增长（多人同时输光时尤甚），买入局在总量过大前停止
+    while (g.phase !== 'gameOver' && hands < 150 && total < 1e12) {
+      if (allowRebuy) for (const r of g.rebuyBusted()) total += r.amount;
+      assert.equal(g.totalBuyIn, total);
       g.startHand();
       hands++;
       let guard = 0;

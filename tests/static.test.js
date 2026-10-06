@@ -33,10 +33,23 @@ test('纯逻辑模块可以在无 DOM 环境中导入', async () => {
   }
 });
 
-test('快捷下注按钮只有 1/3、1/2、2/3、4/3 底池（以及最小、全下）', () => {
+test('快捷下注按钮：翻牌后只有 1/3、1/2、2/3、4/3 底池，翻牌前为大盲尺度（以及最小、全下）', () => {
   const ui = readFileSync(join(root, 'js', 'ui.js'), 'utf8');
   assert.match(ui, /BET_SIZES\.map\(/);
+  assert.match(ui, /preflopQuickSizes\(g, la\)/);
   assert.doesNotMatch(ui, /data-frac/);
   assert.doesNotMatch(ui, />底池<\/button>/);
   assert.match(ui, /data-to="\$\{la\.minRaiseTo\}">最小</);
+});
+
+test('设置项：每手结束后查看电脑手牌、允许重新买入；人类输光时提供“按平均筹码重新买入”', () => {
+  const html = readFileSync(join(root, 'index.html'), 'utf8');
+  const ui = readFileSync(join(root, 'js', 'ui.js'), 'utf8');
+  assert.match(html, /id="setup-review" type="checkbox" checked/);
+  assert.match(html, /id="review-bots"/);
+  assert.match(html, /id="setup-rebuy" type="checkbox" checked/);
+  assert.match(html, /允许重新买入/);
+  assert.match(ui, /按平均筹码重新买入/);
+  assert.match(ui, /data-act="restart"/);
+  assert.match(ui, /继续观看电脑对局/);
 });

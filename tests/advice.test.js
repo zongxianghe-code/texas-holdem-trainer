@@ -52,23 +52,22 @@ test('翻牌前建议：UTG 的 AA 加注、72o 弃牌，并给出反馈', () =>
   assert.equal(adv.freqs.raise, 1);
   assert.equal(adv.primary, 'raise');
   assert.ok(near1(adv.freqs.raise + adv.freqs.call + adv.freqs.fold));
-  assert.ok(allowedSizes(aa.getLegalActions()).some((s) => s.to === adv.raiseTo), '翻牌前加注尺度也只用四种比例');
-  assert.equal(adv.raiseTo, 27); // 10 + 2/3 × (15 + 10)
-  assert.match(adv.sizeText, /2\/3 池/);
+  assert.equal(adv.raiseTo, 25); // 开池 2.5BB
+  assert.match(adv.sizeText, /2\.5BB/);
   assert.match(adviceSummary(adv), /开池加注 100%/);
-  assert.equal(evaluateDecision(adv, { type: 'raise', amount: 27 }).verdict, 'good');
+  assert.equal(evaluateDecision(adv, { type: 'raise', amount: 25 }).verdict, 'good');
   const bad = evaluateDecision(adv, { type: 'fold' });
   assert.equal(bad.verdict, 'bad');
   assert.match(bad.label, /偏离/);
-  assert.match(bad.text, /偏紧/);
-  assert.match(evaluateDecision(adv, { type: 'raise', amount: 100 }).text, /尺度/);
+  assert.ok(bad.reasons.some((r) => /偏紧/.test(r)), bad.reasons.join('|'));
+  assert.ok(evaluateDecision(adv, { type: 'raise', amount: 100 }).reasons.some((r) => /尺度：建议 2\.5BB/.test(r)));
 
   const trash = six([undefined, undefined, undefined, P('7c 2d')]);
   const a2 = getAdvice(trash);
   assert.equal(a2.primary, 'fold');
   const loose = evaluateDecision(a2, { type: 'call' });
   assert.equal(loose.verdict, 'bad');
-  assert.match(loose.text, /偏松/);
+  assert.ok(loose.reasons.some((r) => /偏松/.test(r)), loose.reasons.join('|'));
 });
 
 test('翻牌前建议：大盲面对庄位开池时防守，可免费过牌时不建议弃牌', () => {
@@ -145,6 +144,7 @@ test('翻牌后建议：带免责声明、频率和为 1、尺度只用四种比
   const fb = evaluateDecision(adv, { type: 'check' });
   assert.ok(['ok', 'bad', 'good'].includes(fb.verdict));
   assert.match(fb.text, /近似建议/);
+  assert.ok(fb.reasons.length > 0);
 });
 
 test('翻牌后建议：空气牌面对超池下注应弃牌', () => {
@@ -155,5 +155,118 @@ test('翻牌后建议：空气牌面对超池下注应弃牌', () => {
   assert.equal(adv.primary, 'fold');
   assert.ok(adv.need > 0.3);
   assert.equal(evaluateDecision(adv, { type: 'fold' }).verdict, 'good');
-  assert.equal(evaluateDecision(adv, { type: 'call' }).verdict, 'bad');
+  const fb = evaluateDecision(adv, { type: 'call' });
+  assert.equal(fb.verdict, 'bad');
+  assert.ok(fb.reasons.some((r) => /跟注偏松/.test(r) && /低于/.test(r)), fb.reasons.join('|'));
+  // 理由与推荐动作一致：提到赔率、胜率不足、MDF，并属于放弃的部分
+  const all = adv.reasons.join('');
+  assert.ok(adv.reasons.length >= 2 && adv.reasons.length <= 4);
+  assert.match(all, /底池赔率要求/);
+  assert.match(all, /不足/);
+  assert.match(all, /MDF/);
+  assert.match(all, /放弃/);
+  assert.doesNotMatch(all, /胜率足够支付跟注/);
+});
+
+test('翻牌后理由：强牌给出价值理由与尺度理由', () => {
+  const g = flopSpot(P('As Ah'), P('Qd Jd'), P('Ac 7d 2h 5s 9c'));
+  const adv = getAdvice(g, g.toAct, { iterations: 800, rng: mulberry32(5) });
+  const all = adv.reasons.join('');
+  assert.ok(adv.reasons.length >= 2 && adv.reasons.length <= 4, adv.reasons.join('|'));
+  assert.match(all, /价值/);
+  assert.match(all, /尺度/);
+  assert.match(all, /牌面/);
+});
+
+test('翻牌前尺度：以大盲为单位的常规尺度', () => {
+  const sz = (g) => getAdvice(g).raiseTo;
+  // 开池 2.5BB
+  assert.equal(sz(six()), 25);
+  // 小盲开池 3BB
+  const sb = six();
+  for (let i = 0; i < 4; i++) sb.act({ type: 'fold' });
+  assert.equal(getAdvice(sb).position, 'SB');
+  assert.equal(sz(sb), 30);
+  // 有位置 3bet 3 倍：UTG 开到 25，HJ 3bet 到 75
+  const ip = six();
+  ip.act({ type: 'raise', amount: 25 });
+  assert.equal(sz(ip), 75);
+  assert.match(getAdvice(ip).sizeText, /3 倍/);
+  // 无位置 3bet 4 倍：大盲面对庄位 25 → 100
+  const oop = six();
+  for (let i = 0; i < 3; i++) oop.act({ type: 'fold' });
+  oop.act({ type: 'raise', amount: 25 });
+  oop.act({ type: 'fold' });
+  assert.equal(sz(oop), 100);
+  // 挤压：4 倍 + 每名跟注者 1 倍 → 25 × 5 = 125
+  const sq = six();
+  sq.act({ type: 'raise', amount: 25 });
+  sq.act({ type: 'call' });
+  assert.equal(getAdvice(sq).spot.callersAfter, 1);
+  assert.equal(sz(sq), 125);
+  // 4bet 约 2.2 倍：25 → 3bet 75 → 4bet 165
+  const fb = six();
+  fb.act({ type: 'raise', amount: 25 });
+  fb.act({ type: 'raise', amount: 75 });
+  for (let i = 0; i < 4; i++) fb.act({ type: 'fold' });
+  assert.equal(fb.toAct, 3);
+  assert.equal(sz(fb), 165);
+  // 5bet 全下
+  fb.act({ type: 'raise', amount: 165 });
+  assert.equal(sz(fb), 1000);
+  assert.match(getAdvice(fb).sizeText, /全下/);
+  // 隔离溜入：3BB + 每名溜入者 1BB
+  const iso = six();
+  iso.act({ type: 'call' });
+  iso.act({ type: 'call' });
+  assert.equal(sz(iso), 50);
+});
+
+test('行动面板翻牌前快捷尺度：开池 2/2.5/3BB，面对加注 3x/4x，面对 3bet 2.2x/3x', async () => {
+  const { preflopQuickSizes } = await import('../js/strategy.js');
+  const g = six();
+  assert.deepEqual(preflopQuickSizes(g, g.getLegalActions()).map((o) => [o.label, o.to]), [['2BB', 20], ['2.5BB', 25], ['3BB', 30]]);
+  g.act({ type: 'raise', amount: 25 });
+  assert.deepEqual(preflopQuickSizes(g, g.getLegalActions()).map((o) => [o.label, o.to]), [['3x', 75], ['4x', 100]]);
+  g.act({ type: 'raise', amount: 75 });
+  assert.deepEqual(preflopQuickSizes(g, g.getLegalActions()).map((o) => o.label), ['2.2x', '3x']);
+});
+
+test('翻牌前理由：2–4 条，且与推荐动作一致', () => {
+  const check = (adv) => {
+    assert.ok(adv.reasons.length >= 2 && adv.reasons.length <= 4, adv.reasons.join('|'));
+    for (const r of adv.reasons) assert.ok(r.length > 4);
+  };
+  // AA 开池：位置/范围宽度 + 尺度理由
+  const aa = getAdvice(six([undefined, undefined, undefined, P('As Ad')]));
+  check(aa);
+  assert.match(aa.reasons[0], /身后还有 5 名玩家/);
+  assert.ok(aa.reasons.some((r) => /2\.5BB/.test(r)));
+  // 72o 弃牌：给出弃牌理由
+  const trash = getAdvice(six([undefined, undefined, undefined, P('7c 2d')]));
+  check(trash);
+  assert.ok(trash.reasons.some((r) => /^弃牌/.test(r)));
+  assert.ok(!trash.reasons.some((r) => /开池 2\.5BB/.test(r)));
+  // 混合频率：UTG 的 98s（50%）说明为什么混合
+  const mix = getAdvice(six([undefined, undefined, undefined, P('9s 8s')]));
+  check(mix);
+  assert.ok(mix.reasons.some((r) => /混合/.test(r)));
+  // 被压制风险：BTN 开池、SB 面对时的 K8o（弃牌）
+  const dom = six([undefined, P('Kc 8d')]);
+  for (let i = 0; i < 3; i++) dom.act({ type: 'fold' });
+  dom.act({ type: 'raise', amount: 25 });
+  const d = getAdvice(dom);
+  check(d);
+  assert.equal(d.primary, 'fold');
+  assert.ok(d.reasons.some((r) => /压制/.test(r)));
+  // 阻断牌 + 无位置大尺度：小盲面对 CO 开池的 A5s（3bet 60%）
+  const bl = six([undefined, P('As 5s')]);
+  for (let i = 0; i < 2; i++) bl.act({ type: 'fold' });
+  bl.act({ type: 'raise', amount: 25 });
+  bl.act({ type: 'fold' });
+  const b = getAdvice(bl);
+  check(b);
+  assert.equal(b.primary, 'raise');
+  assert.ok(b.reasons.some((r) => /阻断/.test(r)), b.reasons.join('|'));
+  assert.ok(b.reasons.some((r) => /位置劣势/.test(r)), b.reasons.join('|'));
 });

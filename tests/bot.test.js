@@ -3,15 +3,15 @@ import assert from 'node:assert/strict';
 import { parseCards, mulberry32 } from '../js/cards.js';
 import { HoldemGame } from '../js/engine.js';
 import { decideBotAction, legalize } from '../js/bot.js';
-import { allowedSizes, BET_SIZES, potFractionTo } from '../js/strategy.js';
+import { allowedSizes, BET_SIZES, potFractionTo, preflopStrategy } from '../js/strategy.js';
 
 const P = parseCards;
 const sum = (a) => a.reduce((x, y) => x + y, 0);
 
 /** 跑电脑对局，校验每一步的合法性和尺度 */
-function runBots({ seed, games, maxHands, difficulty, players, stack, iterations = 60 }) {
+function runBots({ seed, games, maxHands, difficulty, players, stack, iterations = 60, rebuy = false }) {
   const rng = mulberry32(seed);
-  const stats = { hands: 0, actions: 0, raises: 0, showdowns: 0, sidePots: 0, games: 0 };
+  const stats = { hands: 0, actions: 0, raises: 0, preRaises: 0, postRaises: 0, showdowns: 0, sidePots: 0, games: 0, rebuys: 0 };
   for (let gi = 0; gi < games; gi++) {
     const n = players ?? 2 + (gi % 5);
     const g = new HoldemGame({
@@ -21,16 +21,28 @@ function runBots({ seed, games, maxHands, difficulty, players, stack, iterations
       bigBlind: 10,
       dealerSeat: gi % n,
       rng,
+      allowRebuy: rebuy,
     });
-    const total = g.totalChips;
+    const initial = g.totalChips;
+    let total = initial; // 筹码守恒：桌面总筹码 = 初始筹码 + 重新买入
     let h = 0;
     while (g.phase !== 'gameOver' && h < maxHands) {
+      if (rebuy) {
+        for (const r of g.rebuyBusted()) {
+          total += r.amount;
+          stats.rebuys++;
+        }
+        assert.ok(g.players.every((p) => !p.out && p.stack > 0), '重新买入后应保持满桌');
+      }
+      assert.equal(g.totalBuyIn, total, '累计买入应等于初始筹码 + 重新买入');
       g.startHand();
       h++;
       let guard = 0;
       while (g.phase === 'betting') {
         assert.ok(guard++ < 300, '一手牌没有结束');
         const la = g.getLegalActions();
+        const preflop = g.street === 'preflop';
+        const expectedPre = preflop ? preflopStrategy(g, la.seat).raiseTo : null;
         const d = decideBotAction(g, { rng, difficulty, iterations });
         // 合法性（在执行前独立检查）
         if (d.type === 'check') assert.ok(la.canCheck, '非法过牌');
@@ -39,8 +51,16 @@ function runBots({ seed, games, maxHands, difficulty, players, stack, iterations
         if (d.type === 'bet' || d.type === 'raise') {
           assert.ok(la.canRaise, '非法加注');
           assert.ok(d.amount >= la.minRaiseTo && d.amount <= la.maxRaiseTo, `加注金额越界 ${d.amount}`);
-          const allowed = allowedSizes(la).map((s) => s.to);
-          assert.ok(allowed.includes(d.amount), `尺度 ${d.amount} 不在四种允许尺度 ${allowed} 中`);
+          if (preflop) {
+            // 翻牌前：以大盲为单位的常规尺度（开池 2.5BB / 3bet 3–4 倍 / 4bet 2.2 倍 …），限制在合法区间
+            assert.equal(d.amount, expectedPre, `翻牌前尺度 ${d.amount} ≠ 推荐 ${expectedPre}`);
+            stats.preRaises++;
+          } else {
+            // 翻牌后：只允许 1/3、1/2、2/3、4/3 底池
+            const allowed = allowedSizes(la).map((s) => s.to);
+            assert.ok(allowed.includes(d.amount), `尺度 ${d.amount} 不在四种允许尺度 ${allowed} 中`);
+            stats.postRaises++;
+          }
           stats.raises++;
         }
         g.act(d); // 若非法，引擎会抛出异常导致测试失败
@@ -48,6 +68,7 @@ function runBots({ seed, games, maxHands, difficulty, players, stack, iterations
         assert.equal(g.totalChips, total, '筹码不守恒');
       }
       assert.equal(sum(g.players.map((p) => p.stack)), total);
+      assert.equal(sum(g.players.map((p) => g.netProfit(p.seat))), 0, '净盈亏之和应为 0');
       assert.equal(sum(Object.values(g.result.winnings)), g.result.totalPot);
       if (g.result.type === 'showdown') {
         stats.showdowns++;
@@ -63,7 +84,7 @@ function runBots({ seed, games, maxHands, difficulty, players, stack, iterations
 test('电脑对局（标准难度，2–6 人，随机筹码）：数千手牌无非法动作、筹码守恒、每手都能结束', () => {
   const s = runBots({ seed: 42, games: 60, maxHands: 60, difficulty: 'standard' });
   assert.ok(s.hands >= 2000, `只跑了 ${s.hands} 手`);
-  assert.ok(s.raises > 500);
+  assert.ok(s.preRaises > 300 && s.postRaises > 300, `翻牌前 ${s.preRaises} / 翻牌后 ${s.postRaises} 次加注`);
   assert.ok(s.showdowns > 100);
   assert.ok(s.sidePots > 0, '应出现过边池');
 });
@@ -76,6 +97,12 @@ test('电脑对局（简单难度，6 人 100BB）', () => {
 test('电脑对局（短筹码，频繁全下）', () => {
   const s = runBots({ seed: 99, games: 40, maxHands: 40, difficulty: 'standard', players: 6, stack: 150 });
   assert.ok(s.hands >= 200);
+});
+
+test('电脑对局（允许重新买入）：始终 6 人满桌，筹码 = 初始 + 重新买入', () => {
+  const s = runBots({ seed: 123, games: 6, maxHands: 150, difficulty: 'standard', players: 6, stack: 300, rebuy: true });
+  assert.equal(s.hands, 900, '允许重新买入时不会提前结束');
+  assert.ok(s.rebuys > 20, `只发生了 ${s.rebuys} 次重新买入`);
 });
 
 test('legalize 总能把任意意图转为合法动作', () => {
@@ -106,7 +133,7 @@ test('legalize 总能把任意意图转为合法动作', () => {
   assert.ok(checked > 100);
 });
 
-test('四种下注尺度：1/3、1/2、2/3、4/3 底池，并限制在合法区间', () => {
+test('翻牌后四种下注尺度：1/3、1/2、2/3、4/3 底池，并限制在合法区间', () => {
   assert.deepEqual(BET_SIZES.map((b) => b.frac), [1 / 3, 1 / 2, 2 / 3, 4 / 3]);
   // 翻牌后底池 60，无人下注
   const la = { currentBet: 0, bet: 0, pot: 60, minRaiseTo: 10, maxRaiseTo: 1000 };
